@@ -1,0 +1,104 @@
+---
+title: "cv_lasso_new"
+author: "Xieyao Yin,Jeremy Liu,Rachel Rubanguka Hoops,Casey Lee"
+date: "2024-12-02"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+```{r}
+# load packages
+library(dplyr)
+library(rstan)
+library(bayesplot)
+library(caret)
+library(posterior)
+library(glmnet)
+library(ggplot2)
+```
+Pre-Processing(should be the same)
+```{r}
+cleaned_data <- read.csv("C:\\Users\\Rachel\\Desktop\\final_proj_code_datascie_451\\sampled_data4.csv")
+
+cleaned_data <- cleaned_data %>%
+  select(-Description, -Wind_Chill.F., -Start_Lat, -Start_Lng, -City, -No_Exit, 
+         -County, -State, -Start_Time, -End_Time, -Timezone, -Duration, -Bump, -Traffic_Calming)
+
+binary_columns <- c("Amenity", "Traffic_Signal", "Junction", "Crossing")
+cleaned_data[binary_columns] <- lapply(cleaned_data[binary_columns], 
+                                       function(x) as.integer(factor(x, levels = c("False", "True"), labels = c(0, 1))))
+
+numeric_columns <- c("Temperature.F.", "Humidity...", "Pressure.in.", "Visibility.mi.", 
+                     "Wind_Speed.mph.", "Precipitation.in.")
+cleaned_data[numeric_columns] <- lapply(cleaned_data[numeric_columns], as.numeric)
+cleaned_data[numeric_columns] <- scale(cleaned_data[numeric_columns])
+
+categorical_columns <- c("Wind_Direction", "Weather_Condition", "Time_of_Day")
+cleaned_data[categorical_columns] <- lapply(cleaned_data[categorical_columns], 
+                                            function(x) as.integer(factor(x)))
+
+cleaned_data$Severity <- as.factor(cleaned_data$Severity)
+levels(cleaned_data$Severity)[levels(cleaned_data$Severity) == "4"] <- "3"
+y <- as.numeric(cleaned_data$Severity)
+```
+Test: Train-Test split, CV, lasso
+```{r}
+X <- cleaned_data %>% select(-Severity) %>% as.matrix()
+
+set.seed(123)
+cv_lasso <- cv.glmnet(X, y, alpha = 1, family = "multinomial", type.measure = "class")
+
+best_lambda <- cv_lasso$lambda.min
+cat("Best Lambda:", best_lambda, "\n")
+
+lasso_model <- glmnet(X, y, alpha = 1, lambda = best_lambda, family = "multinomial")
+
+lasso_coefficients <- coef(lasso_model)
+
+significant_predictors <- lapply(lasso_coefficients, function(class_coeff) {
+  rownames(class_coeff)[class_coeff[, 1] != 0]
+})
+
+cat("Significant Predictors:\n")
+print(significant_predictors)
+
+cv_misclassification_rate <- cv_lasso$cvm[cv_lasso$lambda == best_lambda]
+cat("Cross-Validation Misclassification Rate:", cv_misclassification_rate, "\n")
+```
+Focus on Shared Predictors:
+Temperature.F., Pressure.in., Weather_Condition, Wind_Speed.mph., Crossing
+
+```{r}
+shared_predictors <- c("Temperature.F.", "Pressure.in.", "Weather_Condition", 
+                       "Wind_Speed.mph.", "Crossing")
+
+coeff_data <- data.frame()  
+
+for (i in seq_along(lasso_coefficients)) {
+  class_coeff <- as.matrix(lasso_coefficients[[i]])
+  filtered <- class_coeff[rownames(class_coeff) %in% shared_predictors, , drop = FALSE]
+  
+  if (nrow(filtered) > 0) {
+    temp_data <- data.frame(Predictor = rownames(filtered), 
+                            Coefficient = filtered[, 1], 
+                            Class = paste("Class", i))
+    coeff_data <- rbind(coeff_data, temp_data)
+  }
+}
+
+if (nrow(coeff_data) > 0) {
+  ggplot(coeff_data, aes(x = reorder(Predictor, Coefficient), y = Coefficient, fill = Class)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    coord_flip() +
+    labs(title = "Coefficients for Shared Predictors Across Classes",
+         x = "Predictors",
+         y = "Coefficient Magnitude",
+         fill = "Class") +
+    theme_minimal()
+} else {
+  cat("No coefficients found for the specified shared predictors.\n")
+}
+```
+

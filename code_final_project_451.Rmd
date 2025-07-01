@@ -1,0 +1,344 @@
+---
+title: "451"
+author: "Jeremy Liu,Rachel Rubanguka Hoops,Xieyao Yin,Casey Lee "
+date: "2024-12-02"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(rstan)
+library(bayesplot)
+library(caret)
+library(posterior)
+library(tidyr)
+library(glmnet)
+library(brms)
+set.seed(123)
+```
+
+
+```{r}
+#knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+#library(dplyr)
+#library(tidyr)
+
+data = read.csv("US_Accidents_March23_sampled_500k.csv")
+
+head(data)
+colnames(data)
+
+cleaned_data <- data %>% select(
+  Severity, Distance.mi., Description, Start_Lat, Start_Lng, City, County, State,
+  Start_Time, End_Time, Timezone, Temperature.F., Wind_Chill.F., Humidity...,
+  Pressure.in., Visibility.mi., Wind_Direction, Wind_Speed.mph., Precipitation.in.,
+  Weather_Condition, Amenity, Bump, Crossing, Junction, No_Exit,
+  Traffic_Calming, Traffic_Signal
+)
+
+cleaned_data <- cleaned_data %>% 
+  select(
+    which(colSums(is.na(.)) / nrow(.) < 0.5)
+  )
+
+cleaned_data <- cleaned_data %>% drop_na(Severity, Start_Time, Start_Lat, Start_Lng)
+
+cleaned_data <- cleaned_data %>%
+  mutate(
+    Start_Time = as.POSIXct(Start_Time, format = "%Y-%m-%d %H:%M:%S"),
+    End_Time = as.POSIXct(End_Time, format = "%Y-%m-%d %H:%M:%S")
+  )
+
+categorical_cols <- c("City", "County", "State", "Timezone", "Weather_Condition",
+                      "Wind_Direction", "Amenity", "Bump", "Crossing", "Junction",
+                      "No_Exit", "Traffic_Calming", "Traffic_Signal")
+cleaned_data <- cleaned_data %>% mutate(across(all_of(categorical_cols), as.factor))
+
+
+
+cleaned_data <- cleaned_data %>%
+  mutate(Duration = as.numeric(difftime(End_Time, Start_Time, units = "mins")))
+
+cleaned_data <- cleaned_data %>%
+  mutate(Time_of_Day = case_when(
+    format(Start_Time, "%H") %in% c(6:11) ~ "Morning",
+    format(Start_Time, "%H") %in% c(12:17) ~ "Afternoon",
+    format(Start_Time, "%H") %in% c(18:21) ~ "Evening",
+    TRUE ~ "Night"
+  ))
+
+cleaned_data <- na.omit(cleaned_data)
+print(colnames(cleaned_data))
+
+# save to csv
+write.csv(cleaned_data, "cleaned_data.csv", row.names = FALSE)
+
+cleaned_data <- read.csv("cleaned_data.csv")
+
+sampled_data <- cleaned_data %>%
+  group_by(Severity) %>%
+  slice_sample(n = 400) %>%
+  ungroup()
+
+head(sampled_data)
+
+write.csv(sampled_data, "sampled_data4.csv", row.names = FALSE)
+```
+
+
+
+main
+```{r}
+cleaned_data <- read.csv("sampled_data4.csv")
+cleaned_data <- cleaned_data %>%
+  select(Severity, Crossing, Amenity, Traffic_Signal, Temperature.F., Junction, 
+         Distance.mi., Wind_Speed.mph., Precipitation.in.)
+
+
+# CONVERT INT
+binary_columns <- c("Amenity", "Traffic_Signal", "Junction", "Crossing")
+cleaned_data[binary_columns] <- lapply(cleaned_data[binary_columns], function(x) as.numeric(as.logical(x)))
+cleaned_data <- cleaned_data %>%
+  mutate(
+    Interaction_1 = Crossing * Traffic_Signal,
+    Interaction_2 = Traffic_Signal * Amenity,
+    Interaction_3 = Crossing * Amenity,
+    Interaction_4 = Amenity * Traffic_Signal * Crossing
+  )
+
+
+# SCALE NUMERICS
+numeric_columns <- c("Temperature.F.", "Distance.mi.", "Wind_Speed.mph.", "Precipitation.in.")
+cleaned_data[numeric_columns] <- lapply(cleaned_data[numeric_columns], as.numeric)
+cleaned_data[numeric_columns] <- scale(cleaned_data[numeric_columns])
+# CONVERT INT
+categorical_columns <- c()
+cleaned_data[categorical_columns] <- lapply(cleaned_data[categorical_columns], function(x) as.integer(factor(x)))
+
+# CONVERT TO ORDERED FACTOR
+cleaned_data$Severity <- factor(cleaned_data$Severity, levels = 1:4, ordered = TRUE)
+
+# prepare matrices
+X <- cleaned_data %>%
+  select(-Severity) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+y <- as.integer(cleaned_data$Severity)
+
+
+```
+
+
+```{r}
+# BAYES ORDINAL MODEL
+fit_ordinal <- brm(
+  Severity ~ Crossing + Amenity + Traffic_Signal + Temperature.F. + 
+    Junction + Distance.mi. + Interaction_1 + Interaction_2 + Interaction_3 + Interaction_4 + Wind_Speed.mph. + Precipitation.in.,
+  data = cleaned_data,
+  family = cumulative(),
+  chains = 4, iter = 2000, warmup = 1000,
+  prior = c( # uninformative priors
+    set_prior("normal(0, 1)", class = "b"),         # coefs
+    set_prior("cauchy(0, 2)", class = "Intercept")  # thresholds
+  )
+)
+
+summary(fit_ordinal)
+
+# predicted probabilities for each class (level of severity)
+fitted_probs <- fitted(fit_ordinal, scale = "response")
+str(fitted_probs)
+
+# extract estimates of predicted probabilities
+fitted_probs_estimate <- fitted_probs[, "Estimate", ]
+
+# check structure again for indexing
+str(fitted_probs_estimate)
+
+# make class prediction
+y_pred_class <- apply(fitted_probs_estimate, 1, function(x) {
+  which.max(x)  # index of highest prob class
+})
+
+# misclass rate
+misclassification_rate <- mean(y != y_pred_class)
+print(cat("Misclassification rate:", misclassification_rate, "\n"))
+```
+
+
+```{r}
+
+# Extract posterior samples using as_draws
+posterior_samples <- as_draws_df(fit_ordinal)
+
+# Ensure it's a data frame and extract coefficients (prefix 'b_')
+beta_samples <- posterior_samples %>%
+  select(starts_with("b_"))  # Extract coefficients (prefix 'b_')
+
+# Convert to matrix for plotting
+beta_matrix <- as.matrix(beta_samples)
+
+# Plot posterior distributions using mcmc_areas
+mcmc_areas(beta_matrix) +
+  ggtitle("Posterior Distributions of Beta Coefficients") +
+  theme_minimal()
+
+```
+
+
+```{r}
+# Summarize sampled data
+summary(sampled_data)
+
+# Quantitative variables in sampled data
+sampled_data %>%
+  select(where(is.numeric)) %>%
+  summary()
+
+# Categorical variables in sampled data
+sampled_data %>%
+  select(where(is.factor)) %>%
+  lapply(table)
+
+# Accident Severity Distribution
+ggplot(sampled_data, aes(x = factor(Severity))) +
+  geom_bar(fill = "lightblue") +
+  labs(title = "Accident Severity Distribution", x = "Severity", y = "Count")
+
+# Accidents by Time of Day
+ggplot(sampled_data, aes(x = Time_of_Day)) +
+  geom_bar(fill = "orange") +
+  labs(title = "Accidents by Time of Day", x = "Time of Day", y = "Count")
+
+
+# Accident Distance by Severity
+ggplot(sampled_data, aes(x = factor(Severity), y = Distance.mi.)) +
+  geom_boxplot(fill = "blue") +
+  labs(title = "Accident Distance by Severity", x = "Severity", y = "Distance (miles)")
+
+# Accident Severity by Time of Day
+ggplot(sampled_data, aes(x = Time_of_Day, fill = factor(Severity))) +
+  geom_bar(position = "dodge") +
+  labs(title = "Accident Severity by Time of Day", x = "Time of Day", y = "Count", fill = "Severity")
+
+# Severity by Weather Condition
+ggplot(sampled_data, aes(x = Weather_Condition, fill = factor(Severity))) +  theme_minimal() +
+  theme(axis.text.y = element_text(size = 5))+  # Set smaller size for y-axis labels
+  geom_bar(position = "dodge", width =2) + coord_flip()
+  labs(title = "Severity by Weather Condition", x = "Weather Condition", y = "Count", fill = "Severity")
+  
+  # Severity by Weather Condition with smaller y-axis text
+ggplot(sampled_data, aes(x = Weather_Condition, fill = factor(Severity))) +
+  geom_bar(position = "dodge", width = 3) +  # Adjust bar width
+  coord_flip() +
+  labs(
+    title = "Severity by Weather Condition",
+    x = "Weather Condition",
+    y = "Count",
+    fill = "Severity"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 5),  # Set smaller size for y-axis labels
+    plot.title = element_text(hjust = 1, size = 10), # Center and enlarge title
+    legend.position = "bottom" # Move legend to bottom
+  )
+
+
+
+library(dplyr)
+
+
+cleaned_data <- read.csv("sampled_data4.csv")
+
+set.seed(123)
+cleaned_data <- cleaned_data %>%
+  select(Temperature.F., Wind_Chill.F., Humidity..., Pressure.in., Visibility.mi.,
+         Wind_Direction, Wind_Speed.mph., Precipitation.in., Weather_Condition, 
+         Amenity, Bump, Crossing, Junction, No_Exit, Traffic_Calming, Traffic_Signal, 
+         Duration, Time_of_Day, Distance.mi.)
+
+
+binary_columns <- c("Amenity", "Bump", "No_Exit", "Traffic_Calming", "Traffic_Signal", "Junction", "Crossing")
+cleaned_data[binary_columns] <- lapply(cleaned_data[binary_columns], function(x) 
+  as.integer(factor(x, levels = c("False", "True"), labels = c(0, 1))))
+
+
+numeric_columns <- c("Temperature.F.", "Wind_Chill.F.", "Humidity...", "Wind_Speed.mph.",
+                     "Distance.mi.", "Precipitation.in.", "Pressure.in.", "Duration")
+cleaned_data[numeric_columns] <- lapply(cleaned_data[numeric_columns], as.numeric)
+cleaned_data[numeric_columns] <- scale(cleaned_data[numeric_columns])
+
+
+categorical_columns <- c("Weather_Condition", "Time_of_Day", "Wind_Direction","Visibility.mi.")
+cleaned_data[categorical_columns] <- lapply(cleaned_data[categorical_columns], function(x) {as.integer(factor(x))})
+
+
+cor_matrix <- cor(cleaned_data)
+print(cor_matrix)
+
+heatmap(cor_matrix, 
+        main = "Correlation Matrix", 
+        col = colorRampPalette(c("blue", "white", "red"))(100), 
+        scale = "none", 
+        margins = c(10, 10),
+        Rowv = NA,    # readability
+        Colv = NA,    
+)
+
+
+```
+
+
+
+
+MCMC tracing, posterior and Posterior predictive check
+```{r}
+library(bayesplot)
+
+# Use mcmc_trace with brms model (fit_ordinal)
+# Extract draws as an array
+trace_data <- as_draws_array(fit_ordinal)
+
+# Plot trace for specific parameters
+mcmc_trace(trace_data, pars = c("b_Crossing", "b_Amenity", "b_Traffic_Signal","b_Temperature.F.", "b_Junction", "b_Distance.mi.", "b_Wind_Speed.mph.", "b_Precipitation.in.", "b_Interaction_1", "b_Interaction_2")) +
+  ggtitle("Trace Plots for Selected Parameters") +
+  theme_minimal()
+
+# Posterior distributions for coefficients
+posterior_samples <- as_draws_df(fit_ordinal)
+
+mcmc_areas(
+  posterior_samples %>% select(starts_with("b_")),
+  prob = 0.9  # 90% credible intervals
+) +
+  ggtitle("Posterior Distributions with 90% Credible Intervals") +
+  theme_minimal()
+
+# Posterior predictive check
+pp_check(fit_ordinal) +
+  ggtitle("Posterior Predictive Check")
+```
+
+
+```{r}
+# Rhat and ESS diagnostics
+fit_summary <- summary(fit_ordinal)
+
+# Check fixed effects (coefficients)
+fit_summary$fixed
+
+# Check Rhat values (should be close to 1 for convergence)
+fit_summary$rhat
+```
+
+
+
+
+
+

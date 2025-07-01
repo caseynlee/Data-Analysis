@@ -1,0 +1,180 @@
+---
+title: "bayes_model_latest"
+author: "Xieyao Yin,Jeremy Liu,Rachel Rubanguka Hoops,Casey Lee"
+date: "2024-12-02"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(rstan)
+library(bayesplot)
+library(caret)
+library(posterior)
+library(tidyr)
+library(posterior)
+```
+Bayes Model
+```{r}
+cleaned_data <- read.csv("C:\\Users\\Rachel\\Desktop\\final_proj_code_datascie_451\\sampled_data4.csv")
+
+cleaned_data <- cleaned_data %>%
+  select(-Description, -Wind_Chill.F., -Start_Lat, -Start_Lng, -City, -No_Exit, 
+         -County, -State, -Start_Time, -End_Time, -Timezone, -Duration, -Bump, -Traffic_Calming)
+
+binary_columns <- c("Amenity", "Traffic_Signal", "Junction", "Crossing")
+cleaned_data[binary_columns] <- lapply(cleaned_data[binary_columns], 
+                                       function(x) as.integer(factor(x, levels = c("False", "True"), labels = c(0, 1))))
+
+numeric_columns <- c("Temperature.F.", "Humidity...", "Pressure.in.", "Visibility.mi.", 
+                     "Wind_Speed.mph.", "Precipitation.in.")
+cleaned_data[numeric_columns] <- lapply(cleaned_data[numeric_columns], as.numeric)
+cleaned_data[numeric_columns] <- scale(cleaned_data[numeric_columns])
+
+cleaned_data$Severity <- as.factor(cleaned_data$Severity)
+levels(cleaned_data$Severity)[levels(cleaned_data$Severity) == "4"] 
+y <- as.numeric(cleaned_data$Severity)
+```
+double check levels
+```{r}
+print(levels(cleaned_data$Severity)) 
+print(table(cleaned_data$Severity))  
+```
+Weights Balance
+```{r}
+significant_predictors <- c("Temperature.F.", "Pressure.in.", 
+                            "Weather_Condition", "Wind_Speed.mph.", "Crossing")
+cleaned_data <- cleaned_data %>%
+  mutate(
+    Weather_Condition = as.numeric(factor(Weather_Condition)),
+    Crossing = as.numeric(Crossing) 
+  )
+# replace NAs with mean
+cleaned_data <- cleaned_data %>%
+  mutate(across(all_of(significant_predictors), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+
+# interaction
+cleaned_data <- cleaned_data %>%
+  mutate(
+    Interaction_1 = Temperature.F. * Pressure.in.,
+    Interaction_2 = Wind_Speed.mph. * Crossing,
+    Polynomial_Temp = Temperature.F.^2
+  )
+
+significant_predictors <- c(significant_predictors, "Interaction_1", "Interaction_2", "Polynomial_Temp")
+
+X <- cleaned_data %>% select(all_of(significant_predictors)) %>% as.matrix()
+X <- apply(X, 2, as.numeric)  
+
+y <- as.integer(cleaned_data$Severity)
+
+class_weights <- table(y)
+class_weights <- max(class_weights) / class_weights
+```
+X debugging
+```{r}
+print(dim(X))         # Check dimensions
+print(any(is.na(X)))  # Should return FALSE
+```
+
+```{r}
+# Update Stan Data
+stan_data <- list(
+  N = nrow(X),
+  K = ncol(X),
+  X = X,
+  y = y,
+  class_weights = as.numeric(class_weights)
+)
+
+stan_model_code <- "
+data {
+  int<lower=0> N;           // Number of observations
+  int<lower=0> K;           // Number of predictors
+  matrix[N, K] X;           // Predictor matrix
+  int<lower=1, upper=4> y[N]; // Response variable (severity levels 1-4)
+  vector[4] class_weights;  // Class weights for imbalance
+}
+
+parameters {
+  real alpha;                // Intercept
+  vector[K] beta;            // Coefficients for predictors
+}
+
+model {
+  // Priors
+  alpha ~ normal(0, 20);      // Less restrictive prior
+  beta ~ normal(0, 10);       // Regularized priors
+  
+  // Weighted likelihood
+  for (n in 1:N) {
+    vector[4] log_odds;  // Log-odds for each class
+    for (k in 1:4) {
+      log_odds[k] = alpha + dot_product(X[n], beta);  // Compute log-odds for each class
+    }
+    target += categorical_logit_lpmf(y[n] | log_odds) * class_weights[y[n]];
+  }
+}
+
+generated quantities {
+  int y_pred[N];
+  for (n in 1:N) {
+    vector[4] log_odds;
+    for (k in 1:4) {
+      log_odds[k] = alpha + dot_product(X[n], beta);
+    }
+    y_pred[n] = categorical_logit_rng(log_odds);
+  }
+}
+"
+```
+model results part(if we have misclassification rate from someone else's output, feel free to adjust or just ignore)
+```{r}
+fit <- stan(model_code = stan_model_code, data = stan_data, iter = 2000, warmup = 500, 
+            chains = 4, control = list(adapt_delta = 0.95, max_treedepth = 15))
+
+posterior_samples <- rstan::extract(fit)
+y_pred <- posterior_samples$y_pred
+
+bayesplot::ppc_bars(y, y_pred)
+
+y_pred_class <- apply(y_pred, 2, function(x) which.max(table(x)))
+misclassification_rate <- mean(y != y_pred_class)
+cat("Misclassification Rate:", misclassification_rate, "\n")
+```
+MAE part
+```{r}
+mae <- mean(abs(y - y_pred_class))
+cat("Mean Absolute Error (MAE):", mae, "\n")
+```
+BSS/Convergence/Summary Statistics
+```{r}
+# BSS Calculation
+y_pred_class <- apply(y_pred, 2, function(x) which.max(table(x)))
+residuals <- y - y_pred_class
+variance_residuals <- var(residuals)
+variance_observed <- var(y)
+bss <- 1 - (variance_residuals / variance_observed)
+cat("Bayesian Signal-to-Noise Ratio (BSS):", bss, "\n")
+
+# Convergence Diagnostics
+fit_summary <- summary(fit)$summary
+rhat <- fit_summary[, "Rhat"]
+ess <- fit_summary[, "n_eff"]
+cat("Max R-hat:", max(rhat), "\n")
+cat("Min Effective Sample Size (ESS):", min(ess), "\n")
+
+# Posterior Summaries
+posterior_samples <- rstan::extract(fit)
+beta_means <- colMeans(posterior_samples$beta)
+cat("Posterior Means of Beta Coefficients:\n")
+print(beta_means)
+
+beta_credible_intervals <- apply(posterior_samples$beta, 2, function(x) quantile(x, probs = c(0.025, 0.975)))
+cat("95% Credible Intervals for Beta Coefficients:\n")
+print(beta_credible_intervals)
+```
+
+
